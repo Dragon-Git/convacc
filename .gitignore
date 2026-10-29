@@ -1,0 +1,34 @@
+# --- build & simulation output ---
+build/
+*.o
+*.pyc
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# --- generated hardware (rebuild with `make rtl-gen`) ---
+hw/convacc_mem.sv
+hw/convacc_top.sv
+hw/convacc_sram.sv
+
+# --- generated DSLX harnesses (rebuild with tools/gen_dslx_*.py) ---
+hw/dslx_cmp.x
+hw/dslx_equiv.x
+hw/dslx_fullsys.x
+hw/dslx_fullsys_*.x
+hw/dslx_fullsys.files
+hw/dslx_probe.x
+hw/dslx_probe_rand.x
+hw/dslx_rand.x
+hw/dslx_synth.x
+
+# --- WorkBuddy session state ---
+.workbuddy/
+
+# --- editor / OS ---
+.DS_Store
+*.swp
