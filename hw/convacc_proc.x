@@ -842,9 +842,10 @@ fn apply_load_past_the_end_is_dropped_test() {
 fn phase_clear_with_no_reduction_left_opens_no_group_test() {
     // kb*8 == k means the reduction is already finished, so the clear step must
     // hand phase_mac an empty block instead of dividing by a stale remainder.
+    let ze = zero_engine<u32:16>();
     let st = Engine<u32:16> {
         cfg: update(zero!<u64[16]>(), u32:2, u64:8),
-        kb: u32:1, ..zero_engine<u32:16>()
+        kb: u32:1, ..ze
     };
     let nst = phase_clear(st);
     assert_eq(nst.block_groups, u32:0);
@@ -855,7 +856,8 @@ fn phase_clear_with_no_reduction_left_opens_no_group_test() {
 fn phase_mac_on_an_empty_block_latches_err_test() {
     // The guard is what keeps a bad (kb, k) pair from reading the tiles: the
     // engine latches err and parks in the terminal phase rather than computing.
-    let st = Engine<u32:16> { block_groups: u32:0, group_index: u32:0, ..zero_engine<u32:16>() };
+    let ze = zero_engine<u32:16>();
+    let st = Engine<u32:16> { block_groups: u32:0, group_index: u32:0, ..ze };
     let nst = phase_mac(st);
     assert_eq(nst.err, u1:1);
     assert_eq(nst.phase, u8:13);
@@ -865,7 +867,8 @@ fn phase_mac_on_an_empty_block_latches_err_test() {
 
 #[test]
 fn phase_mac_on_a_real_block_keeps_err_clear_test() {
-    let st = Engine<u32:16> { block_groups: u32:1, group_index: u32:0, ..zero_engine<u32:16>() };
+    let ze = zero_engine<u32:16>();
+    let st = Engine<u32:16> { block_groups: u32:1, group_index: u32:0, ..ze };
     let nst = phase_mac(st);
     assert_eq(nst.err, u1:0);
     assert_eq(nst.phase, u8:10);
@@ -1018,10 +1021,11 @@ fn pack_cfg_for_readback() -> u64[16] {
 
 #[test]
 fn cfg_accessors_read_back_test() {
+    let ze = zero_engine<u32:16>();
     let st = Engine<u32:16> {
         cfg: update(update(pack_cfg_for_readback(), u32:12, lohi(u32:27, u32:28)),
                     u32:14, lohi(u32:30, u32:32)),
-        ..zero_engine<u32:16>()
+        ..ze
     };
     assert_eq(flags_gemm(st), true);
     assert_eq(flags_channel(st), true);
@@ -1097,7 +1101,8 @@ fn out_cfg(flags: u32, m: u32, n: u32, mh: u32, mw: u32, co: u32,
 }
 
 fn out_st(cfg: u64[16], mt: u32, nt: u32, n_tiles: u32) -> Engine<u32:16> {
-    Engine<u32:16> { cfg, mt, nt, n_tiles, ..zero_engine<u32:16>() }
+    let ze = zero_engine<u32:16>();
+    Engine<u32:16> { cfg, mt, nt, n_tiles, ..ze }
 }
 
 #[test]
@@ -1206,9 +1211,10 @@ fn engine_step_mem_k0_skips_the_load_loop_test() {
     // k == 0 means the phase contributes nothing to the accumulator. It must
     // jump straight to the parameter load instead of walking the tile loader
     // (and must not emit any memory traffic).
+    let ze = zero_engine<u32:16>();
     let st = Engine<u32:16> {
         cfg: update(zero!<u64[16]>(), u32:2, u64:0),
-        phase: u8:4, ..zero_engine<u32:16>()
+        phase: u8:4, ..ze
     };
     let (nst, done, req) = engine_step_mem(
         st, false, u32:0, MemIn { act_data: u64:0, wgt_data: u64:0, out_data: u64:0 });
@@ -1246,9 +1252,10 @@ fn gemm_k0_image() -> u64[32] {
 
 #[test]
 fn engine_step_k0_still_writes_requant_of_zero_test() {
+    let ze = zero_engine<u32:32>();
     let st = Engine<u32:32> {
         wgt: gemm_k0_image(),
-        desc_start: u32:0, ..zero_engine<u32:32>()
+        desc_start: u32:0, ..ze
     };
     let (final_st, done) = for (i, (st, done)): (u32, (Engine<u32:32>, bool))
             in u32:0..u32:200 {
@@ -1294,8 +1301,9 @@ fn qc_gemm_image(k: u32, log_r: u2) -> u64[32] {
 /// Run that descriptor to completion. Returns
 /// (steps taken, number of `done` pulses, err flag, output word 0).
 fn qc_run_gemm(k: u32, log_r: u2) -> (u32, u32, u1, u64) {
+    let ze = zero_engine<u32:32>();
     let st0 = Engine<u32:32> {
-        wgt: qc_gemm_image(k, log_r), desc_start: u32:0, ..zero_engine<u32:32>()
+        wgt: qc_gemm_image(k, log_r), desc_start: u32:0, ..ze
     };
     let (st, steps, pulses, _) = for (i, (st, steps, pulses, done)):
             (u32, (Engine<u32:32>, u32, u32, bool)) in u32:0..u32:2048 {
@@ -1357,9 +1365,10 @@ fn tile_geometry_divisors_are_never_zero_check(log_r: u2) -> bool {
     // `std::ceil_div` traps on a zero divisor, so every divisor the tile
     // geometry feeds it must be provably non-zero. Both come from log_r:
     // cfg_o = 8 >> log_r is 8/4/2/1 and cfg_r = 1 << log_r is 1/2/4/8.
+    let ze = zero_engine<u32:16>();
     let st = Engine<u32:16> {
         cfg: update(zero!<u64[16]>(), u32:0, (log_r as u64) << u32:3),
-        ..zero_engine<u32:16>()
+        ..ze
     };
     cfg_o(st) != u32:0 && cfg_r(st) != u32:0 && u32:8 != u32:0
 }
@@ -1412,10 +1421,11 @@ fn qc_cfg(mode: u3, group: u2) -> u64[16] {
 }
 
 fn qc_st(mode: u3, group: u2, mt: u2, nt: u2) -> Engine<u32:16> {
+    let ze = zero_engine<u32:16>();
     Engine<u32:16> {
         cfg: qc_cfg(mode, group),
         mt: mt as u32, nt: nt as u32, n_tiles: u32:4,
-        ..zero_engine<u32:16>()
+        ..ze
     }
 }
 

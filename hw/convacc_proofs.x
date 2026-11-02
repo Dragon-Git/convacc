@@ -56,8 +56,9 @@ pub fn image(k: u32, log_r: u2) -> u64[32] {
 /// gets its own unrolled copy -- the solver's cost is set by this number.
 /// Returns (steps taken, number of done pulses, err flag, output word 0).
 pub fn run<N: u32>(k: u32, log_r: u2) -> (u32, u32, u1, u64) {
+    let ze = convacc_proc::zero_engine<u32:32>();
     let st0 = convacc_proc::Engine<u32:32> {
-        wgt: image(k, log_r), desc_start: u32:0, ..convacc_proc::zero_engine<u32:32>()
+        wgt: image(k, log_r), desc_start: u32:0, ..ze
     };
     let (st, steps, pulses, _) = for (i, (st, steps, pulses, done)):
             (u32, (convacc_proc::Engine<u32:32>, u32, u32, bool)) in u32:0..N {
