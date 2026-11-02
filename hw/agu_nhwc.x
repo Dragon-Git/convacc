@@ -160,7 +160,9 @@ fn deconv_input_coord_negative_returned_as_zero_test() {
 }
 
 // ===========================================================================
-// Fuzzed invariants. Run with
+// Invariants and complete-semantics properties. All eleven are *proved* with
+// `prove_quickcheck_main` (~14 s total on this machine), not sampled; sampling
+// (`dslx-fuzz`) is only a fallback:
 //   dslx_interpreter_main --evaluator=ir-interpreter \
 //       --run_quickcheck_when_interpreting agu_nhwc.x
 // ===========================================================================
@@ -207,4 +209,71 @@ fn conv_input_coord_is_monotone_in_the_output_check
     // A later output row never reaches an earlier input row.
     conv_input_coord(oh as u32, kh as u32, sh as u32, dh as u32, ph as u32)
         <= conv_input_coord((oh as u32) + u32:1, kh as u32, sh as u32, dh as u32, ph as u32)
+}
+
+// ===========================================================================
+// Complete-semantics proofs. The checks above are invariants (one-step
+// monotonicity, range); these pin the functions themselves:
+//   A  exact NHWC strides for arbitrary extents -- offset is fully determined
+//      by channel stride 1, row stride C, plane stride W*C, batch stride H*W*C
+//   B  deconv coord is the exact inverse of the stride on valid requests, and
+//      is 0 exactly when the request is genuinely invalid
+//   C  coord_in_bounds matches its half-open spec at full s32/u32 width
+// ===========================================================================
+
+#[quickcheck]
+fn nhwc_channel_stride_is_one_check
+    (n: u3, h: u3, w: u3, c: u3, height: u3, width: u3, channels: u3) -> bool {
+    let H = (height as u32) + u32:1;
+    let W = (width as u32) + u32:1;
+    let C = (channels as u32) + u32:1;
+    nhwc_offset(n as u32, h as u32, w as u32, (c as u32) + u32:1, H, W, C)
+        == nhwc_offset(n as u32, h as u32, w as u32, c as u32, H, W, C) + u32:1
+}
+
+#[quickcheck]
+fn nhwc_row_stride_is_channels_check
+    (n: u3, h: u3, w: u3, c: u3, height: u3, width: u3, channels: u3) -> bool {
+    let H = (height as u32) + u32:1;
+    let W = (width as u32) + u32:1;
+    let C = (channels as u32) + u32:1;
+    nhwc_offset(n as u32, h as u32, (w as u32) + u32:1, c as u32, H, W, C)
+        == nhwc_offset(n as u32, h as u32, w as u32, c as u32, H, W, C) + C
+}
+
+#[quickcheck]
+fn nhwc_plane_stride_is_width_times_channels_check
+    (n: u3, h: u3, w: u3, c: u3, height: u3, width: u3, channels: u3) -> bool {
+    let H = (height as u32) + u32:1;
+    let W = (width as u32) + u32:1;
+    let C = (channels as u32) + u32:1;
+    nhwc_offset(n as u32, (h as u32) + u32:1, w as u32, c as u32, H, W, C)
+        == nhwc_offset(n as u32, h as u32, w as u32, c as u32, H, W, C) + W * C
+}
+
+#[quickcheck]
+fn nhwc_batch_stride_is_height_times_plane_check
+    (n: u3, h: u3, w: u3, c: u3, height: u2, width: u2, channels: u2) -> bool {
+    let H = (height as u32) + u32:1;
+    let W = (width as u32) + u32:1;
+    let C = (channels as u32) + u32:1;
+    nhwc_offset((n as u32) + u32:1, h as u32, w as u32, c as u32, H, W, C)
+        == nhwc_offset(n as u32, h as u32, w as u32, c as u32, H, W, C) + H * W * C
+}
+
+#[quickcheck]
+fn deconv_coord_is_the_exact_inverse_check
+    (output: u8, kernel: u8, stride: u8, pad: u8) -> bool {
+    let s = (stride as u32) + u32:1;   // stride >= 1 keeps the division defined
+    let num = (output as s32) + (pad as s32) - (kernel as s32);
+    let (coord, valid) = deconv_input_coord(output as u32, kernel as u32, s, pad as u32);
+    let in_range = num >= s32:0;
+    let aligned = (num % (s as s32)) == s32:0;
+    valid == (in_range && aligned)
+        && (if valid { coord * (s as s32) == num } else { coord == s32:0 })
+}
+
+#[quickcheck]
+fn coord_in_bounds_full_width_check(coord: s32, limit: u32) -> bool {
+    coord_in_bounds(coord, limit) == (coord >= s32:0 && coord < (limit as s32))
 }

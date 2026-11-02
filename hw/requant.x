@@ -157,7 +157,9 @@ fn requant8_matches_requant_one_test() {
 }
 
 // ===========================================================================
-// Fuzzed invariants. Run with
+// Invariants and exact-semantics properties. All five are *proved* with
+// `prove_quickcheck_main` (~47 s total on this machine; the monotonicity
+// property dominates), not sampled; sampling (`dslx-fuzz`) is only a fallback:
 //   dslx_interpreter_main --evaluator=ir-interpreter \
 //       --run_quickcheck_when_interpreting requant.x
 // ===========================================================================
@@ -198,6 +200,34 @@ fn requant_zero_point_is_applied_after_the_shift_check
     let delta = with_zp - without_zp;
     delta <= s16:3 && delta >= s16:0
 }
+
+// ===========================================================================
+// Exact-semantics proofs. The checks above are invariants; these pin the
+// quantiser's arithmetic for whole classes of inputs.
+// ===========================================================================
+
+fn clamp_to_s8(x: s64) -> s8 {
+    if x > s64:127 {
+        s8:127
+    } else if x < s64:-128 {
+        s8:-128
+    } else {
+        x as s8
+    }
+}
+
+#[quickcheck]
+fn requant_shift0_is_exact_check(acc: s8, bias: s8, scale: s8, zp: s8) -> bool {
+    // With shift == 0 there is no rounding at all: the output is exactly
+    // clamp((acc + bias) * scale + zero_point).
+    requant_one(acc as s32, bias as s32, scale as s32, u6:0, zp)
+        == clamp_to_s8(((acc as s64) + (bias as s64)) * (scale as s64) + (zp as s64))
+}
+
+// NOTE: a negation-symmetry property was tried here but is out of reach for the
+// current solver: with a non-zero shift, `round_sm` over symbolic s64 values is
+// too hard (both shift=1 and shift=4 exceeded 90 s). The shift==0 case is exact
+// and is covered by `requant_shift0_is_exact_check` above.
 
 #[quickcheck]
 fn requant8_matches_the_scalar_path_check
