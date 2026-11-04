@@ -3,7 +3,37 @@ from __future__ import annotations
 import numpy as np
 
 from .packer import PackedPlan, canonical_conv_weights
+from .planner import output_coords
 from .spec import ConvSpec, GemmSpec
+
+
+def requantize(
+    accumulators: np.ndarray,
+    bias: np.ndarray,
+    scale: np.ndarray,
+    shift: np.ndarray,
+    zero_point: np.ndarray,
+) -> np.ndarray:
+    """Per-channel INT32 accumulators to INT8.
+
+    q = round_away_from_zero((acc + bias) * scale / 2**shift) + zero_point
+    """
+    acc = np.asarray(accumulators, dtype=np.int64)
+    bias64 = np.asarray(bias, dtype=np.int64)
+    scale64 = np.asarray(scale, dtype=np.int64)
+    shift64 = np.asarray(shift, dtype=np.int64)
+    zp64 = np.asarray(zero_point, dtype=np.int64)
+    if np.any(scale64 <= 0) or np.any(scale64 > 0x7FFFFFFF):
+        raise ValueError("scale must be a positive int32")
+    if np.any(shift64 < 0) or np.any(shift64 > 31):
+        raise ValueError("shift must be in 0..31")
+    if np.any(zp64 < -128) or np.any(zp64 > 127):
+        raise ValueError("zero_point must fit int8")
+    q = (acc + bias64) * scale64
+    magnitude = np.abs(q)
+    rounded = np.where(shift64 == 0, magnitude, (magnitude + (np.int64(1) << (shift64 - 1))) >> shift64)
+    signed = np.where(q >= 0, rounded, -rounded) + zp64
+    return np.clip(signed, -128, 127).astype(np.int8)
 
 
 def conv_reference(spec: ConvSpec, activations: np.ndarray, canonical_weights: np.ndarray) -> np.ndarray:
@@ -43,21 +73,12 @@ def _deconv_reference(spec: ConvSpec, activations: np.ndarray, canonical_weights
     return output
 
 
-def _output_coords(spec: ConvSpec, task, m_index: int) -> tuple[int, int, int]:
-    per_batch = task.mh * task.mw
-    batch = m_index // per_batch
-    rem = m_index % per_batch
-    oh = task.phase_h + (rem // task.mw) * task.out_step_h
-    ow = task.phase_w + (rem % task.mw) * task.out_step_w
-    return batch, oh, ow
-
-
 def _dense_activations(spec: ConvSpec, task, r: int, activations: np.ndarray) -> np.ndarray:
     kh, kw = task.taps[r // task.ci_count]
     ci = task.ci_base + r % task.ci_count
     result = np.zeros(task.m, dtype=np.int32)
     for m_index in range(task.m):
-        batch, oh, ow = _output_coords(spec, task, m_index)
+        batch, oh, ow = output_coords(task, m_index)
         if spec.kind == "deconv2d":
             ih_num = oh + spec.ph - kh
             iw_num = ow + spec.pw - kw
@@ -80,7 +101,7 @@ def _channelwise_activations(
     ci = co // spec.co_per_group
     result = np.zeros(task.m, dtype=np.int32)
     for m_index in range(task.m):
-        batch, oh, ow = _output_coords(spec, task, m_index)
+        batch, oh, ow = output_coords(task, m_index)
         ih = oh * spec.sh + kh * spec.dh - spec.ph
         iw = ow * spec.sw + kw * spec.dw - spec.pw
         if 0 <= ih < spec.hi and 0 <= iw < spec.wi:
@@ -112,7 +133,7 @@ def _execute_packed_conv(packed: PackedPlan, activations: np.ndarray) -> np.ndar
                         acts = _dense_activations(spec, task, reduction, activations)
                     acc[:, o] += acts * weight
             for m_index in range(task.m):
-                batch, oh, ow = _output_coords(spec, task, m_index)
+                batch, oh, ow = output_coords(task, m_index)
                 co0 = task.co_base + nt * task.o
                 output[batch, oh, ow, co0 : co0 + width] = acc[m_index, :width]
     return output

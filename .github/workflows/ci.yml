@@ -1,0 +1,312 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Every push to main must actually finish its native regression. Cancelling
+  # the previous run on a fast series of pushes would silently skip one; PRs
+  # still cancel their own stale runs.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  # Pinned so CI and local runs use the same toolchain. Bump both together.
+  XLSYNTH_VERSION: "0.61.0"
+  XLSYNTH_TARBALL: xlsynth-bin-linux-x86_64-0.61.0.tar.gz
+  XLSYNTH_SHA256: 8a7acc8a592163ec8d308cd997088573b134cebf5cd03300f9d9954e9f55e0f3
+  VERILATOR_VERSION: "5.054"
+  VERILATOR_TARBALL: verilator-v5.054-linux-x86_64.tar.gz
+  # Building FuzzTest pulls in abseil + re2 + antlr, which dominates a cold
+  # native build. ccache turns the second run into a few minutes.
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 2G
+  # A GitHub-hosted runner is 4 vCPU. The golden regression is split into 20
+  # jobs of this size; `--jobs` comes from here rather than from `nproc`, so a
+  # bigger runner image cannot silently oversubscribe a shard.
+  SHARD_CORES: 4
+  SHARD_COUNT: 20
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Both toolchains are large and immutable, so cache the unpacked trees.
+      # `make` finds xlsynth at ~/opt/xlsynth-bin/bin; the export below puts
+      # Verilator on PATH for cocotb.
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/opt/xlsynth-bin
+            ~/opt/verilator
+          key: toolchain-xls-${{ env.XLSYNTH_VERSION }}-verilator-${{ env.VERILATOR_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install xlsynth-bin
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/opt"
+          if [ ! -x "$HOME/opt/xlsynth-bin/bin/ir_converter_main" ]; then
+            url="https://github.com/EDAPack/xlsynth-bin/releases/download/v${XLSYNTH_VERSION}/${XLSYNTH_TARBALL}"
+            curl -fsSL --retry 3 --retry-delay 2 -o /tmp/xlsynth.tar.gz "$url"
+            echo "${XLSYNTH_SHA256}  /tmp/xlsynth.tar.gz" | sha256sum -c -
+            tar -xzf /tmp/xlsynth.tar.gz -C "$HOME/opt"
+          fi
+          # `ir_converter_main --help` exits 1 (abseil flags), so a bare
+          # invocation fails `set -e` on a perfectly healthy install. Verify
+          # the unpacked layout instead, with a useful message if it drifted.
+          if [ ! -x "$HOME/opt/xlsynth-bin/bin/ir_converter_main" ]; then
+            echo "xlsynth-bin: expected ~/opt/xlsynth-bin/bin/ir_converter_main" >&2
+            find "$HOME/opt" -maxdepth 4 -name 'ir_converter_main' >&2 || true
+            exit 1
+          fi
+
+      - name: Install Verilator
+        run: |
+          set -euo pipefail
+          if [ ! -x "$HOME/opt/verilator/bin/verilator" ]; then
+            url="https://github.com/ktbarrett/verilator-builds/releases/download/v${VERILATOR_VERSION}/${VERILATOR_TARBALL}"
+            curl -fsSL --retry 3 --retry-delay 2 -o /tmp/verilator.tar.gz "$url"
+            mkdir -p "$HOME/opt/verilator"
+            tar -xzf /tmp/verilator.tar.gz -C "$HOME/opt/verilator" --strip-components=1
+          fi
+          echo "$HOME/opt/verilator/bin" >> "$GITHUB_PATH"
+          "$HOME/opt/verilator/bin/verilator" --version
+
+      - name: Install Python dependencies
+        run: |
+          set -euo pipefail
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements.txt
+
+      - name: Software and DSLX unit tests
+        run: |
+          make software-test
+          make dslx-test
+
+      - name: DSLX fuzz and formal proofs
+        run: |
+          make dslx-fuzz
+          make dslx-prove
+
+      - name: Generate RTL
+        # The two check_ir_equivalence_main proofs do not converge on the
+        # 64-bit MAC under xlsynth 0.61.0 (42+ min, no output). IR_EQUIV=0
+        # skips just those proofs; both SV files are still generated, and the
+        # DSLX-level proofs ran in the previous step.
+        run: |
+          make rtl-gen
+          make rtl IR_EQUIV=0
+
+      - name: cocotb regression (Verilator)
+        run: make cocotb-test XDIST=auto
+
+  # Same Verilated model, driven from C++: no VPI per signal, no per-chunk
+  # interpreter startup, SRAM images loaded with memcpy. This job builds it
+  # once and checks everything that fits on one machine -- the ported reference
+  # model (GoogleTest), the DUT (GoogleTest), the property-based suite
+  # (FuzzTest) and the generator/Python cross-check. The golden regression is
+  # what needs twenty machines, so it runs in native-shards below.
+  native-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/opt/xlsynth-bin
+            ~/opt/verilator
+          key: toolchain-xls-${{ env.XLSYNTH_VERSION }}-verilator-${{ env.VERILATOR_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install xlsynth-bin
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/opt"
+          if [ ! -x "$HOME/opt/xlsynth-bin/bin/ir_converter_main" ]; then
+            url="https://github.com/EDAPack/xlsynth-bin/releases/download/v${XLSYNTH_VERSION}/${XLSYNTH_TARBALL}"
+            curl -fsSL --retry 3 --retry-delay 2 -o /tmp/xlsynth.tar.gz "$url"
+            echo "${XLSYNTH_SHA256}  /tmp/xlsynth.tar.gz" | sha256sum -c -
+            tar -xzf /tmp/xlsynth.tar.gz -C "$HOME/opt"
+          fi
+          # `ir_converter_main --help` exits 1 (abseil flags), so a bare
+          # invocation fails `set -e` on a perfectly healthy install. Verify
+          # the unpacked layout instead, with a useful message if it drifted.
+          if [ ! -x "$HOME/opt/xlsynth-bin/bin/ir_converter_main" ]; then
+            echo "xlsynth-bin: expected ~/opt/xlsynth-bin/bin/ir_converter_main" >&2
+            find "$HOME/opt" -maxdepth 4 -name 'ir_converter_main' >&2 || true
+            exit 1
+          fi
+
+      - name: Install Verilator
+        run: |
+          set -euo pipefail
+          if [ ! -x "$HOME/opt/verilator/bin/verilator" ]; then
+            url="https://github.com/ktbarrett/verilator-builds/releases/download/v${VERILATOR_VERSION}/${VERILATOR_TARBALL}"
+            curl -fsSL --retry 3 --retry-delay 2 -o /tmp/verilator.tar.gz "$url"
+            mkdir -p "$HOME/opt/verilator"
+            tar -xzf /tmp/verilator.tar.gz -C "$HOME/opt/verilator" --strip-components=1
+          fi
+          echo "$HOME/opt/verilator/bin" >> "$GITHUB_PATH"
+          "$HOME/opt/verilator/bin/verilator" --version
+
+      - name: Install Python dependencies
+        run: |
+          set -euo pipefail
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install -r requirements.txt
+
+      # FuzzTest's dependencies (abseil, re2, antlr) are immutable at a given
+      # tag, so the object cache is safe to reuse across runs.
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-native-${{ hashFiles('tests/cpp/CMakeLists.txt') }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-native-${{ hashFiles('tests/cpp/CMakeLists.txt') }}-
+
+      - name: Install ccache and mold
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ccache mold
+
+      - name: Generate RTL
+        run: make rtl-gen
+
+      # clang compiles Verilator's generated eval() ~1.6x faster than gcc; the
+      # probe picks the newest clang++ it can actually compile C++17 with.
+      # Print it, so a runner image that loses clang does not silently turn the
+      # native regression into a g++ run.
+      - name: Model compiler
+        run: |
+          cxx=$(sh tools/find_clangxx.sh)
+          if [ -n "$cxx" ]; then
+            echo "model compiler: $cxx"
+            $cxx --version | head -1
+          else
+            echo "::warning::no usable clang++ found; the model builds with g++ (~1.6x slower)"
+          fi
+
+      - name: Build native harness
+        run: make native-build NATIVE_CMAKE_FLAGS="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCONVACC_WITH_FUZZTEST=ON"
+
+      - name: Prepare cases
+        run: make native-cases
+
+      - name: C++ model tests (GoogleTest, no simulator)
+        run: ./tests/cpp/build/convacc_model_tests
+
+      - name: C++ DUT tests (GoogleTest)
+        run: ./tests/cpp/build/convacc_dut_tests
+
+      # One process per test in parallel: each FUZZ_TEST runs on its own core
+      # with the full budget, instead of four tests sharing one process. The
+      # runner has 4 vCPUs, so `auto` asks for 4 shards.
+      - name: Property tests (FuzzTest, sharded)
+        run: sh tools/run_fuzz_shards.sh tests/cpp/build/convacc_fuzz auto 60s build/fuzz-logs
+
+      # The generated corpus is trusted only because Python can rebuild it
+      # byte for byte.
+      - name: Generated cases reproduce in Python
+        run: make native-cross-check
+
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+      # The shard jobs run nothing but this binary. The corpus is generated
+      # in-process, so the grid travels with the executable -- no data
+      # artifact, no case directory to sync between twenty machines.
+      - name: Publish the golden driver
+        uses: actions/upload-artifact@v4
+        with:
+          name: convacc-bench
+          path: tests/cpp/build/convacc_bench
+          retention-days: 7
+
+  # Twenty runners x four cores run the golden grids, split twenty ways.
+  # `--shard I/20` keeps every twentieth case starting at I: disjoint and
+  # exhaustive, so the twenty jobs together check 9,972 + 1,675,050 cases.
+  # The full grid is the expensive one: ~13 min per shard on four cores
+  # (measured 106 cases/s), with a 35 min ceiling for slower runners.
+  native-shards:
+    needs: native-build
+    strategy:
+      fail-fast: false
+      # Cap the matrix at the 20 runners we have, so a future grid change
+      # cannot silently start more jobs than the account can run at once.
+      max-parallel: 20
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    name: native shard ${{ matrix.shard }}/20
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: convacc-bench
+          path: bin
+
+      - name: Golden regression
+        run: |
+          set -u
+          chmod +x bin/convacc_bench
+          status=0
+          bin/convacc_bench --gen-scale 1 --shard ${{ matrix.shard }}/${{ env.SHARD_COUNT }} \
+            --jobs ${{ env.SHARD_CORES }} --json golden-1x-shard${{ matrix.shard }}.json || status=1
+          bin/convacc_bench --grid full --shard ${{ matrix.shard }}/${{ env.SHARD_COUNT }} \
+            --jobs ${{ env.SHARD_CORES }} --json golden-full-shard${{ matrix.shard }}.json || status=1
+          exit $status
+
+      - name: Publish shard results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-${{ matrix.shard }}
+          path: golden-*.json
+          if-no-files-found: warn
+          retention-days: 7
+
+  # One line for the whole grid, instead of twenty green ticks nobody reads.
+  summary:
+    needs: native-shards
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: golden-*
+          path: shards
+          merge-multiple: true
+
+      - name: Merge shard results
+        run: python3 tools/merge_shard_reports.py shards

@@ -142,7 +142,12 @@ def _deconv_tasks(spec: ConvSpec) -> Tuple[Task, ...]:
     return tuple(tasks)
 
 
-def _output_coords(spec: ConvSpec, task: Task, m_index: int) -> Tuple[int, int, int]:
+def output_coords(task: Task, m_index: int) -> Tuple[int, int, int]:
+    """(batch, oh, ow) for position `m_index` of `task`.
+
+    Shared with reference.py, which walks the same positions to produce the
+    expected values -- two copies of this walked out of step once already.
+    """
     per_batch = task.mh * task.mw
     batch = m_index // per_batch
     rem = m_index % per_batch
@@ -155,7 +160,7 @@ def _channelwise_unique_bytes(spec: ConvSpec, task: Task, mt: int, nt: int) -> i
     addresses = set()
     co_per_group = spec.co_per_group
     for p in range(mt * 8, min((mt + 1) * 8, task.m)):
-        batch, oh, ow = _output_coords(spec, task, p)
+        batch, oh, ow = output_coords(task, p)
         for lane in range(nt * 8, min((nt + 1) * 8, task.n)):
             co = lane
             ci = co // co_per_group

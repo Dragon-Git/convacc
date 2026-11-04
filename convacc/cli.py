@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .image import make_image, write_sram_hex
 from .packer import pack_weights
 from .planner import make_plan, plan_to_dict
 from .reference import execute_packed, reference_for_packed
@@ -63,8 +64,6 @@ def main(argv=None) -> int:
 
     weights = np.load(args.weights, allow_pickle=False)
     if args.command == "image":
-        from .image_builder import make_image, write_sram_hex
-
         activations = np.load(args.activations, allow_pickle=False)
         bias = np.load(args.bias) if args.bias else None
         scale = np.load(args.scale) if args.scale else None

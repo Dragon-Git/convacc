@@ -1,11 +1,20 @@
+"""The three 128 KB SRAM images, and the whole case built around them.
+
+`build_image` lays out the descriptors, taps, packed weights and requant
+parameters; `make_image` is the end-to-end entry point (pack -> image -> run the
+reference -> requantise -> lay out). Mirrored in C++ by convacc/image.h and
+convacc::build_case.
+"""
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
-from .packer import PackedPlan
-from .reference import output_geometry
+from .packer import PackedPlan, pack_weights
+from .reference import layout_output, output_geometry, reference_for_packed, requantize
 from .spec import GemmSpec, SRAM_BYTES
 
 WORDS = SRAM_BYTES // 8
@@ -44,6 +53,122 @@ def _u64(*fields: tuple[int, int]) -> int:
     for field, shift in fields:
         value |= (int(field) & ((1 << (64 - shift)) - 1)) << shift
     return value
+
+
+def _bits(word: int, shift: int, width: int) -> int:
+    return (word >> shift) & ((1 << width) - 1)
+
+
+@dataclass(frozen=True)
+class Descriptor:
+    """One descriptor block, read back out of an image.
+
+    The counterpart of the `memory.set(desc_address + n, ...)` block below; the
+    field offsets exist in one place only because both directions are here.
+    Everything is the raw stored value -- callers apply their own defaults.
+    """
+
+    flags: int
+    m: int
+    n: int
+    k: int
+    batches: int
+    mh: int
+    mw: int
+    k_groups: int
+    o: int
+    ci_count: int
+    ci_base: int
+    co_base: int
+    co_per_group: int
+    hi: int
+    wi: int
+    ho: int
+    wo: int
+    ci: int
+    co: int
+    sh: int
+    sw: int
+    dh: int
+    dw: int
+    ph: int
+    pw: int
+    phase_h: int
+    phase_w: int
+    out_step_h: int
+    out_step_w: int
+    act_base: int
+    out_base: int
+    w_base: int
+    param_base: int
+    tap_base: int
+    taps: int
+    next_desc: int
+
+    @property
+    def gemm(self) -> bool:
+        return bool(self.flags & 1)
+
+    @property
+    def channelwise(self) -> bool:
+        return bool(self.flags & 2)
+
+    @property
+    def deconv(self) -> bool:
+        return bool(self.flags & 4)
+
+    @property
+    def log_r(self) -> int:
+        # The writer stores log2(r) above the three flag bits without masking it
+        # to the two bits r needs; read it back at the same width.
+        return (self.flags >> 3) & 0xFF
+
+    @property
+    def r(self) -> int:
+        return 1 << self.log_r
+
+    @property
+    def m_tiles(self) -> int:
+        return (self.m + 7) // 8
+
+    @property
+    def n_tiles(self) -> int:
+        return (self.n + self.o - 1) // self.o if self.o else 0
+
+
+def decode_descriptor(data, start: int = 0) -> Descriptor:
+    """Read the descriptor at word `start` (see `build_image` for the layout).
+
+    `data` is either an SRAM image (bytes) or an already-unpacked word list.
+    """
+    if isinstance(data, (bytes, bytearray)):
+        window = bytes(data)[start * 8:(start + HEADER_WORDS) * 8]
+        w = list(struct.unpack("<%dQ" % (len(window) // 8), window))
+    else:
+        w = list(data)[start:start + HEADER_WORDS]
+    if len(w) != HEADER_WORDS:
+        raise ValueError(f"descriptor needs {HEADER_WORDS} words, got {len(w)}")
+    return Descriptor(
+        flags=w[0],
+        m=_bits(w[1], 0, 32), n=_bits(w[1], 32, 32),
+        k=_bits(w[2], 0, 32), batches=_bits(w[2], 32, 32),
+        mh=_bits(w[3], 0, 16), mw=_bits(w[3], 16, 16),
+        k_groups=_bits(w[4], 0, 32), o=_bits(w[4], 32, 32),
+        ci_count=_bits(w[5], 0, 16), ci_base=_bits(w[5], 16, 16),
+        co_base=_bits(w[5], 32, 16), co_per_group=_bits(w[5], 48, 16),
+        hi=_bits(w[6], 0, 16), wi=_bits(w[6], 16, 16),
+        ho=_bits(w[7], 0, 16), wo=_bits(w[7], 16, 16),
+        ci=_bits(w[8], 0, 16), co=_bits(w[8], 16, 16),
+        sh=_bits(w[9], 0, 16), sw=_bits(w[9], 16, 16),
+        dh=_bits(w[9], 32, 16), dw=_bits(w[9], 48, 16),
+        ph=_bits(w[10], 0, 16), pw=_bits(w[10], 16, 16),
+        phase_h=_bits(w[10], 32, 16), phase_w=_bits(w[10], 48, 16),
+        out_step_h=_bits(w[11], 0, 16), out_step_w=_bits(w[11], 16, 16),
+        act_base=_bits(w[12], 0, 32), out_base=_bits(w[12], 32, 32),
+        w_base=_bits(w[13], 0, 32), param_base=_bits(w[13], 32, 32),
+        tap_base=_bits(w[14], 0, 32), taps=_bits(w[14], 32, 16),
+        next_desc=_bits(w[15], 0, 32),
+    )
 
 
 @dataclass(frozen=True)
@@ -189,3 +314,36 @@ def build_image(
         manifest=manifest,
         output_words=output_words,
     )
+
+
+def write_sram_hex(path: Path, payload: bytes) -> None:
+    if len(payload) != 128 * 1024:
+        raise ValueError("SRAM image must be exactly 128KB")
+    path.write_text("\n".join(f"{int.from_bytes(payload[i:i+8], 'little'):016x}" for i in range(0, len(payload), 8)) + "\n")
+
+
+def make_image(
+    spec,
+    weights: np.ndarray,
+    layout: str,
+    activations: np.ndarray,
+    bias: np.ndarray | None = None,
+    scale: np.ndarray | None = None,
+    shift: np.ndarray | None = None,
+    zero_point: np.ndarray | None = None,
+    activation_base: int = 0,
+    output_base: int = 0,
+):
+    packed = pack_weights(spec, weights, layout)
+    width = spec.n if isinstance(spec, GemmSpec) else spec.co
+    bias = np.zeros(width, dtype=np.int32) if bias is None else np.asarray(bias, dtype=np.int32)
+    scale = np.ones(width, dtype=np.int32) if scale is None else np.asarray(scale, dtype=np.int32)
+    shift = np.zeros(width, dtype=np.uint8) if shift is None else np.asarray(shift, dtype=np.uint8)
+    zero_point = np.zeros(width, dtype=np.int8) if zero_point is None else np.asarray(zero_point, dtype=np.int8)
+    image = build_image(
+        packed, bias, scale, shift, zero_point, np.ascontiguousarray(activations).tobytes(),
+        activation_base=activation_base, output_base=output_base,
+    )
+    accumulators = reference_for_packed(packed, activations, weights, layout)
+    requanted = requantize(accumulators, bias, scale, shift, zero_point)
+    return packed, image, layout_output(packed, requanted)

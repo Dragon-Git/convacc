@@ -1,0 +1,179 @@
+name: dut-fuzz
+
+# An hour of property-based fuzzing across twenty machines, started by hand.
+#
+# ci.yml runs the same suite for 60 s on every push, which is enough to catch a
+# regression in days and useless for finding a new one: the shapes are 12
+# dimensional, and 60 s of mutation barely moves. This workflow is the
+# deliberate search -- twenty runners, four processes each, one hour per
+# process, so every test target gets twenty independent hours.
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Fuzzing time per test process, in minutes (job limit 90)"
+        required: false
+        default: "60"
+
+concurrency:
+  group: dut-fuzz
+  # Never cancel a run somebody started on purpose; queue the next one.
+  cancel-in-progress: false
+
+env:
+  XLSYNTH_VERSION: "0.61.0"
+  XLSYNTH_TARBALL: xlsynth-bin-linux-x86_64-0.61.0.tar.gz
+  XLSYNTH_SHA256: 8a7acc8a592163ec8d308cd997088573b134cebf5cd03300f9d9954e9f55e0f3
+  VERILATOR_VERSION: "5.054"
+  VERILATOR_TARBALL: verilator-v5.054-linux-x86_64.tar.gz
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 2G
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # `make rtl-gen` ends with tools/gen_sram.py, which the Makefile runs as
+      # `.venv/bin/python`. Only the standard library is needed, but the venv
+      # path is hard-coded, so create it.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Create the venv
+        run: python -m venv .venv
+
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/opt/xlsynth-bin
+            ~/opt/verilator
+          key: toolchain-xls-${{ env.XLSYNTH_VERSION }}-verilator-${{ env.VERILATOR_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install xlsynth-bin
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/opt"
+          if [ ! -x "$HOME/opt/xlsynth-bin/bin/ir_converter_main" ]; then
+            url="https://github.com/EDAPack/xlsynth-bin/releases/download/v${XLSYNTH_VERSION}/${XLSYNTH_TARBALL}"
+            curl -fsSL --retry 3 --retry-delay 2 -o /tmp/xlsynth.tar.gz "$url"
+            echo "${XLSYNTH_SHA256}  /tmp/xlsynth.tar.gz" | sha256sum -c -
+            tar -xzf /tmp/xlsynth.tar.gz -C "$HOME/opt"
+          fi
+          # `ir_converter_main --help` exits 1 (abseil flags), so a bare
+          # invocation fails `set -e` on a perfectly healthy install. Verify
+          # the unpacked layout instead, with a useful message if it drifted.
+          if [ ! -x "$HOME/opt/xlsynth-bin/bin/ir_converter_main" ]; then
+            echo "xlsynth-bin: expected ~/opt/xlsynth-bin/bin/ir_converter_main" >&2
+            find "$HOME/opt" -maxdepth 4 -name 'ir_converter_main' >&2 || true
+            exit 1
+          fi
+
+      - name: Install Verilator
+        run: |
+          set -euo pipefail
+          if [ ! -x "$HOME/opt/verilator/bin/verilator" ]; then
+            url="https://github.com/ktbarrett/verilator-builds/releases/download/v${VERILATOR_VERSION}/${VERILATOR_TARBALL}"
+            curl -fsSL --retry 3 --retry-delay 2 -o /tmp/verilator.tar.gz "$url"
+            mkdir -p "$HOME/opt/verilator"
+            tar -xzf /tmp/verilator.tar.gz -C "$HOME/opt/verilator" --strip-components=1
+          fi
+          echo "$HOME/opt/verilator/bin" >> "$GITHUB_PATH"
+          "$HOME/opt/verilator/bin/verilator" --version
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-fuzz-${{ hashFiles('tests/cpp/CMakeLists.txt') }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-fuzz-${{ hashFiles('tests/cpp/CMakeLists.txt') }}-
+            ccache-native-${{ hashFiles('tests/cpp/CMakeLists.txt') }}-
+
+      - name: Install ccache and mold
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ccache mold
+
+      - name: Generate RTL
+        run: make rtl-gen
+
+      # Same recipe as ci.yml: one build, so the binary exercised for an hour
+      # is the binary the regression runs every day.
+      - name: Build native harness
+        run: make native-build NATIVE_CMAKE_FLAGS="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCONVACC_WITH_FUZZTEST=ON"
+
+      - name: Publish the fuzz driver
+        uses: actions/upload-artifact@v4
+        with:
+          name: convacc-fuzz
+          path: tests/cpp/build/convacc_fuzz
+          retention-days: 7
+
+  fuzz:
+    needs: build
+    strategy:
+      fail-fast: false
+      # A finding on one machine does not stop the other 19, but do not exceed
+      # the 20 runners the manual run is sized for.
+      max-parallel: 20
+      matrix:
+        machine: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    runs-on: ubuntu-24.04
+    # Static limit: job-level `timeout-minutes` accepts expressions only in
+    # some GitHub versions, and a parse error would cancel all 20 runners.
+    # 90 min covers the 60 min default plus checkout, artifact download and
+    # log upload. Raise it together with a longer `minutes` input.
+    timeout-minutes: 90
+    name: fuzz machine ${{ matrix.machine }}/20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: convacc-fuzz
+          path: bin
+
+      # Four processes, one per core, one test each: `auto` reads the cgroup
+      # quota (4) and the suite has four tests.
+      #
+      # A single FUZZ_TEST in unit-test mode stops after 10000 mutations, which
+      # is 15-60 s here no matter how large FUZZTEST_FUZZ_FOR is. So the runner
+      # gets a 60 s round budget AND a wall-clock deadline: it restarts each
+      # shard until the hour is up, drawing a fresh PRNG seed per round (printed
+      # as FUZZTEST_PRNG_SEED in the log, so any finding is reproducible). That
+      # is 20 machines x 4 processes x ~60 rounds of real DUT simulation,
+      # rather than 20 machines finishing in a minute and idling.
+      - name: Fuzz
+        env:
+          FUZZ_MINUTES: ${{ inputs.minutes }}
+        run: |
+          set -eu
+          chmod +x bin/convacc_fuzz
+          mkdir -p build/fuzz-logs build/fuzz-reproducers
+          export FUZZTEST_REPRODUCERS_OUT_DIR="$PWD/build/fuzz-reproducers"
+          case "$FUZZ_MINUTES" in
+            ''|*[!0-9]*) echo "minutes must be a positive integer" >&2; exit 2 ;;
+          esac
+          if [ "$FUZZ_MINUTES" -lt 1 ] || [ "$FUZZ_MINUTES" -gt 80 ]; then
+            echo "minutes must be 1..80 (job timeout is 90)" >&2; exit 2
+          fi
+          seconds=$(( FUZZ_MINUTES * 60 ))
+          sh tools/run_fuzz_shards.sh bin/convacc_fuzz auto 60s build/fuzz-logs "$seconds"
+
+      - name: Publish logs and reproducers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.machine }}
+          path: |
+            build/fuzz-logs
+            build/fuzz-reproducers
+          if-no-files-found: warn
+          retention-days: 14

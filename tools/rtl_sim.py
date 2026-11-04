@@ -12,7 +12,7 @@ Run:  python3 tools/rtl_sim.py [case_dir_or_all]
 """
 from __future__ import annotations
 
-import sys
+import argparse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -594,7 +594,10 @@ def simulate(act_bytes, wgt_bytes):
 
 
 def main():
-    target = sys.argv[1] if len(sys.argv) > 1 else "all"
+    parser = argparse.ArgumentParser(description="replay cocotb cases in the DSLX model")
+    parser.add_argument("target", nargs="?", default="all",
+                        help="case name, or 'all' (default)")
+    target = parser.parse_args().target
     cases_dir = ROOT / "build" / "cocotb_cases"
     if target == "all":
         import glob

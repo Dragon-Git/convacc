@@ -1,5 +1,6 @@
 # --- build & simulation output ---
 build/
+tests/cpp/build*/
 *.o
 *.pyc
 
@@ -15,7 +16,7 @@ hw/convacc_mem.sv
 hw/convacc_top.sv
 hw/convacc_sram.sv
 
-# --- generated DSLX harnesses (rebuild with tools/gen_dslx_*.py) ---
+# --- generated DSLX harnesses (rebuild with tools/gen_dslx.py) ---
 hw/dslx_cmp.x
 hw/dslx_equiv.x
 hw/dslx_fullsys.x
@@ -32,3 +33,7 @@ hw/dslx_synth.x
 # --- editor / OS ---
 .DS_Store
 *.swp
+
+# --- libFuzzer -jobs logs ---
+fuzz-*.log
+core.*

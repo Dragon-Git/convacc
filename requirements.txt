@@ -1,0 +1,6 @@
+# Python test/reference dependencies. The RTL toolchain (xlsynth-bin,
+# Verilator) is installed separately -- see .github/workflows/ci.yml.
+numpy==2.4.6
+cocotb==2.1.0
+pytest==9.2.0
+pytest-xdist==3.8.0

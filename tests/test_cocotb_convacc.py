@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "tests" / "cocotb"))
 
 from convacc import ConvSpec, GemmSpec
-from convacc.image_builder import make_image
+from convacc.image import make_image
 from convacc.planner import make_plan
 
 # The RTL is generated from hw/convacc_proc.x by `make rtl-gen`:
@@ -50,95 +50,100 @@ def _quant(width, rng, bias_range=20, scale_max=5, shift_max=5, zp_range=4):
     )
 
 
-def build_cases():
+def iter_cases(scale: int = 1):
+    """Yield the golden corpus.
+
+    ``scale=1`` is the original ~10k set, byte for byte. Larger scales widen
+    the grid axes (stride, 7x7 kernels, more channels) and raise the per-family
+    caps, so the extra cases add shapes rather than repeat existing ones.
+    """
     rng = np.random.default_rng(20261029)
-    cases: list[Case] = []
 
     def add(name, spec, weights, layout, acts, quant=None, quant_width=None):
         width = quant_width if quant_width is not None else (
             spec.n if isinstance(spec, GemmSpec) else spec.co
         )
         q = quant if quant is not None else _quant(width, rng)
-        cases.append(Case(name, spec, weights, layout, acts, *q))
+        yield Case(name, spec, weights, layout, acts, *q)
 
     spec = ConvSpec(n=1, hi=4, wi=4, ci=4, ho=4, wo=4, co=5, kh=3, kw=3, ph=1, pw=1)
-    add("dense_random_quant", spec,
+    yield from add("dense_random_quant", spec,
         rng.integers(-4, 5, (3, 3, 1, 4, 5), dtype=np.int8), "HWGIO",
         rng.integers(-8, 8, (1, 4, 4, 4), dtype=np.int8))
 
     spec = ConvSpec(n=1, hi=5, wi=5, ci=4, ho=5, wo=5, co=6, kh=3, kw=3,
                     dh=2, dw=2, ph=2, pw=2, groups=2)
-    add("group_dilated", spec,
+    yield from add("group_dilated", spec,
         rng.integers(-4, 5, (3, 3, 2, 2, 3), dtype=np.int8), "HWGIO",
         rng.integers(-8, 8, (1, 5, 5, 4), dtype=np.int8))
 
     spec = ConvSpec(n=1, hi=4, wi=4, ci=3, ho=4, wo=4, co=3, kh=3, kw=3,
                     ph=1, pw=1, groups=3)
-    add("depthwise_c3", spec, rng.integers(-4, 5, (3, 3, 3), dtype=np.int8), "HWM",
+    yield from add("depthwise_c3", spec, rng.integers(-4, 5, (3, 3, 3), dtype=np.int8), "HWM",
         rng.integers(-8, 8, (1, 4, 4, 3), dtype=np.int8))
 
     spec = ConvSpec(n=1, hi=3, wi=3, ci=2, ho=3, wo=3, co=4, kh=3, kw=3,
                     ph=1, pw=1, groups=2)
-    add("depth_multiplier2", spec, rng.integers(-4, 5, (3, 3, 4), dtype=np.int8), "HWM",
+    yield from add("depth_multiplier2", spec, rng.integers(-4, 5, (3, 3, 4), dtype=np.int8), "HWM",
         rng.integers(-8, 8, (1, 3, 3, 2), dtype=np.int8))
 
     spec = ConvSpec(n=1, hi=4, wi=4, ci=2, ho=4, wo=4, co=6, kh=3, kw=3,
                     ph=1, pw=1, groups=2)
-    add("depth_multiplier3", spec, rng.integers(-4, 5, (3, 3, 6), dtype=np.int8), "HWM",
+    yield from add("depth_multiplier3", spec, rng.integers(-4, 5, (3, 3, 6), dtype=np.int8), "HWM",
         rng.integers(-8, 8, (1, 4, 4, 2), dtype=np.int8))
 
     spec = ConvSpec(n=1, hi=3, wi=3, ci=2, ho=5, wo=5, co=4, kh=3, kw=3,
                     sh=2, sw=2, ph=1, pw=1, kind="deconv2d")
-    add("deconv_stride2", spec,
+    yield from add("deconv_stride2", spec,
         rng.integers(-4, 5, (3, 3, 2, 4), dtype=np.int8), "HWIO",
         rng.integers(-8, 8, (1, 3, 3, 2), dtype=np.int8))
 
     spec = ConvSpec(n=1, hi=4, wi=4, ci=2, ho=10, wo=7, co=3, kh=3, kw=3,
                     sh=3, sw=2, ph=1, pw=1, kind="deconv2d")
-    add("deconv_asymmetric", spec,
+    yield from add("deconv_asymmetric", spec,
         rng.integers(-4, 5, (3, 3, 2, 3), dtype=np.int8), "HWIO",
         rng.integers(-8, 8, (1, 4, 4, 2), dtype=np.int8))
 
     spec = GemmSpec(m=13, k=7, n=11)
-    add("gemm_n11", spec, rng.integers(-4, 5, (7, 11), dtype=np.int8), "KN",
+    yield from add("gemm_n11", spec, rng.integers(-4, 5, (7, 11), dtype=np.int8), "KN",
         rng.integers(-8, 8, (13, 7), dtype=np.int8))
 
     spec = GemmSpec(m=1, k=1, n=1)
-    add("gemm_r8_tail", spec, rng.integers(-4, 5, (1, 1), dtype=np.int8), "KN",
+    yield from add("gemm_r8_tail", spec, rng.integers(-4, 5, (1, 1), dtype=np.int8), "KN",
         rng.integers(-8, 8, (1, 1), dtype=np.int8))
 
     spec = ConvSpec(n=1, hi=4, wi=4, ci=3, ho=4, wo=4, co=2, kh=1, kw=1)
-    add("kernel1x1", spec,
+    yield from add("kernel1x1", spec,
         rng.integers(-4, 5, (1, 1, 1, 3, 2), dtype=np.int8), "HWGIO",
         rng.integers(-8, 8, (1, 4, 4, 3), dtype=np.int8))
 
     spec = ConvSpec(n=1, hi=15, wi=3, ci=2, ho=15, wo=3, co=3, kh=15, kw=1,
                     ph=7, pw=0)
-    add("kernel15x1", spec,
+    yield from add("kernel15x1", spec,
         rng.integers(-2, 3, (15, 1, 1, 2, 3), dtype=np.int8), "HWGIO",
         rng.integers(-8, 8, (1, 15, 3, 2), dtype=np.int8))
 
     spec = ConvSpec(n=1, hi=3, wi=15, ci=2, ho=3, wo=15, co=3, kh=1, kw=15,
                     ph=0, pw=7)
-    add("kernel1x15", spec,
+    yield from add("kernel1x15", spec,
         rng.integers(-2, 3, (1, 15, 1, 2, 3), dtype=np.int8), "HWGIO",
         rng.integers(-8, 8, (1, 3, 15, 2), dtype=np.int8))
 
     spec = ConvSpec(n=2, hi=7, wi=7, ci=3, ho=3, wo=3, co=4, kh=3, kw=3,
                     sh=3, sw=3, ph=1, pw=1)
-    add("stride3_batch2", spec,
+    yield from add("stride3_batch2", spec,
         rng.integers(-4, 5, (3, 3, 1, 3, 4), dtype=np.int8), "HWGIO",
         rng.integers(-8, 8, (2, 7, 7, 3), dtype=np.int8))
 
     spec = ConvSpec(n=1, hi=7, wi=7, ci=3, ho=7, wo=7, co=4, kh=3, kw=3,
                     dh=3, dw=3, ph=3, pw=3)
-    add("dilation3", spec,
+    yield from add("dilation3", spec,
         rng.integers(-4, 5, (3, 3, 1, 3, 4), dtype=np.int8), "HWGIO",
         rng.integers(-8, 8, (1, 7, 7, 3), dtype=np.int8))
 
     spec = ConvSpec(n=1, hi=6, wi=6, ci=8, ho=6, wo=6, co=8, kh=3, kw=3,
                     ph=1, pw=1, groups=4)
-    add("groups4_co8", spec,
+    yield from add("groups4_co8", spec,
         rng.integers(-4, 5, (3, 3, 4, 2, 2), dtype=np.int8), "HWGIO",
         rng.integers(-8, 8, (1, 6, 6, 8), dtype=np.int8))
 
@@ -147,32 +152,35 @@ def build_cases():
     acts = np.full((1, 3, 3, 4), -128, dtype=np.int8)
     q = (np.full(4, 1000, np.int32), np.full(4, 5, np.int32),
          np.zeros(4, np.uint8), np.full(4, -128, np.int8))
-    add("negative_saturation", spec,
+    yield from add("negative_saturation", spec,
         np.full((3, 3, 1, 4, 4), -128, dtype=np.int8), "HWGIO", acts, q)
 
     q = (np.zeros(4, np.int32), np.ones(4, np.int32),
          np.full(4, 31, np.uint8), np.zeros(4, np.int8))
-    add("shift31_rounding", spec,
+    yield from add("shift31_rounding", spec,
         rng.integers(-4, 5, (3, 3, 1, 4, 4), dtype=np.int8), "HWGIO",
         rng.integers(-8, 8, (1, 3, 3, 4), dtype=np.int8), q)
 
     spec = ConvSpec(n=3, hi=4, wi=4, ci=3, ho=4, wo=4, co=3, kh=3, kw=3,
                     ph=1, pw=1)
-    add("batch3", spec,
+    yield from add("batch3", spec,
         rng.integers(-4, 5, (3, 3, 1, 3, 3), dtype=np.int8), "HWGIO",
         rng.integers(-8, 8, (3, 4, 4, 3), dtype=np.int8))
 
     spec = ConvSpec(n=1, hi=6, wi=6, ci=5, ho=6, wo=6, co=7, kh=3, kw=3,
                     ph=1, pw=1)
     for seed in (1, 2):
-        add(f"random_seed{seed}", spec,
+        yield from add(f"random_seed{seed}", spec,
             rng.integers(-5, 6, (3, 3, 1, 5, 7), dtype=np.int8), "HWGIO",
             rng.integers(-16, 16, (1, 6, 6, 5), dtype=np.int8))
     # Deterministic grid coverage (same seed / axes / quant as the original
     # ~4080 set). Per-family caps below are raised so the suite lands near
     # 10k while every originally-validated case stays byte-for-byte identical.
-    _append_grid_cases(cases, rng)
-    return cases
+    yield from _append_grid_cases(rng, scale)
+
+
+def build_cases(scale: int = 1) -> list[Case]:
+    return list(iter_cases(scale))
 
 
 def _grid_rows(axes):
@@ -190,7 +198,16 @@ def _random_quant(rng, width):
     )
 
 
-def _append_grid_cases(cases, rng):
+def _append_grid_cases(rng, scale):
+    """Yield the deterministic grid sweep.
+
+    The axes are unchanged at ``scale=1``; larger scales add stride, 7x7
+    kernels and wider channel ranges, then raise the per-family cap
+    proportionally. That keeps the original corpus byte-for-byte identical
+    while the extra cases explore new shapes instead of repeating old ones.
+    """
+    digits = 4 if scale == 1 else 5
+
     dense_axes = {
         "n": [1, 2],
         "hi": [2, 3, 4, 5, 6],
@@ -201,27 +218,46 @@ def _append_grid_cases(cases, rng):
         "kw": [1, 3, 5],
         "pad": [0, 1],
     }
+    if scale > 1:
+        dense_axes.update({
+            "hi": list(range(2, 9)),
+            "wi": list(range(2, 9)),
+            "ci": [1, 2, 3, 4, 5, 6, 8],
+            "co": list(range(1, 11)) + [12],
+            "kh": [1, 3, 5, 7],
+            "kw": [1, 3, 5, 7],
+            "sh": [1, 2],
+        })
     rows = _grid_rows(dense_axes)
+    names = tuple(dense_axes)
     accepted = 0
     for index in rng.permutation(len(rows)):
-        if accepted >= 5200:
-            break
-        n, hi, wi, ci, co, kh, kw, pad = map(int, rows[index])
+        v = dict(zip(names, map(int, rows[index])))
+        n, hi, wi, ci, co, kh, kw, pad = (
+            v[k] for k in ("n", "hi", "wi", "ci", "co", "kh", "kw", "pad"))
+        sh = v.get("sh", 1)
         ph = pad * ((kh - 1) // 2)
         pw = pad * ((kw - 1) // 2)
-        ho = hi + 2 * ph - kh + 1
-        wo = wi + 2 * pw - kw + 1
+        ho = (hi + 2 * ph - kh) // sh + 1
+        wo = (wi + 2 * pw - kw) // sh + 1
         if ho <= 0 or wo <= 0:
             continue
         if n * hi * wi * ci > 8192 or n * ho * wo * co > 8192:
             continue
+        # ci == 1 makes the operator channelwise (groups defaults to 1), and a
+        # channelwise n-tile cannot hold more than eight channels: the planner
+        # rejects co_per_group > 8. The original axes never reached this.
+        if ci == 1 and co > 8:
+            continue
         spec = ConvSpec(n=n, hi=hi, wi=wi, ci=ci, ho=ho, wo=wo, co=co,
-                        kh=kh, kw=kw, ph=ph, pw=pw)
+                        kh=kh, kw=kw, sh=sh, sw=sh, ph=ph, pw=pw)
         weights = rng.integers(-5, 6, (kh, kw, 1, ci, co), dtype=np.int8)
         acts = rng.integers(-32, 33, (n, hi, wi, ci), dtype=np.int8)
-        cases.append(Case(f"grid_dense_{accepted:04d}", spec, weights, "HWGIO",
-                          acts, *_random_quant(rng, co)))
+        yield Case(f"grid_dense_{accepted:0{digits}d}", spec, weights, "HWGIO",
+                   acts, *_random_quant(rng, co))
         accepted += 1
+        if accepted >= 5200 * scale:
+            break
 
     depth_axes = {
         "hi": [2, 3, 4],
@@ -232,12 +268,20 @@ def _append_grid_cases(cases, rng):
         "kw": [1, 3, 5],
         "pad": [0, 1],
     }
+    if scale > 1:
+        depth_axes.update({
+            "hi": list(range(2, 9)),
+            "wi": list(range(2, 9)),
+            "kh": [1, 3, 5, 7],
+            "kw": [1, 3, 5, 7],
+        })
     rows = _grid_rows(depth_axes)
+    names = tuple(depth_axes)
     accepted = 0
     for index in rng.permutation(len(rows)):
-        if accepted >= 1300:
-            break
-        hi, wi, ci, mult, kh, kw, pad = map(int, rows[index])
+        v = dict(zip(names, map(int, rows[index])))
+        hi, wi, ci, mult, kh, kw, pad = (
+            v[k] for k in ("hi", "wi", "ci", "mult", "kh", "kw", "pad"))
         co = ci * mult
         if co > 8:
             continue
@@ -251,9 +295,11 @@ def _append_grid_cases(cases, rng):
                         kh=kh, kw=kw, ph=ph, pw=pw, groups=ci)
         weights = rng.integers(-5, 6, (kh, kw, co), dtype=np.int8)
         acts = rng.integers(-32, 33, (1, hi, wi, ci), dtype=np.int8)
-        cases.append(Case(f"grid_depth_{accepted:04d}", spec, weights, "HWM",
-                          acts, *_random_quant(rng, co)))
+        yield Case(f"grid_depth_{accepted:0{digits}d}", spec, weights, "HWM",
+                   acts, *_random_quant(rng, co))
         accepted += 1
+        if accepted >= 1300 * scale:
+            break
 
     deconv_axes = {
         "hi": [2, 3, 4, 5],
@@ -264,12 +310,21 @@ def _append_grid_cases(cases, rng):
         "kw": [1, 3, 5],
         "pad": [1],
     }
+    if scale > 1:
+        deconv_axes.update({
+            "hi": list(range(2, 10)),
+            "wi": list(range(2, 10)),
+            "ci": [1, 2, 3, 4],
+            "co": [1, 2, 3, 4, 5, 6],
+            "pad": [0, 1],
+        })
     rows = _grid_rows(deconv_axes)
+    names = tuple(deconv_axes)
     accepted = 0
     for index in rng.permutation(len(rows)):
-        if accepted >= 1400:
-            break
-        hi, wi, ci, co, kh, kw, pad = map(int, rows[index])
+        v = dict(zip(names, map(int, rows[index])))
+        hi, wi, ci, co, kh, kw, pad = (
+            v[k] for k in ("hi", "wi", "ci", "co", "kh", "kw", "pad"))
         sh = 2
         sw = 2
         ph = pad
@@ -288,27 +343,37 @@ def _append_grid_cases(cases, rng):
             continue
         weights = rng.integers(-5, 6, (kh, kw, ci, co), dtype=np.int8)
         acts = rng.integers(-32, 33, (1, hi, wi, ci), dtype=np.int8)
-        cases.append(Case(f"grid_deconv_{accepted:04d}", spec, weights, "HWIO",
-                          acts, *_random_quant(rng, co)))
+        yield Case(f"grid_deconv_{accepted:0{digits}d}", spec, weights, "HWIO",
+                   acts, *_random_quant(rng, co))
         accepted += 1
+        if accepted >= 1400 * scale:
+            break
 
     gemm_axes = {
         "m": np.arange(1, 17),
         "k": np.arange(1, 17),
         "n": np.arange(1, 17),
     }
+    if scale > 1:
+        gemm_axes = {
+            "m": np.arange(1, 33),
+            "k": np.arange(1, 33),
+            "n": np.arange(1, 33),
+        }
     rows = _grid_rows(gemm_axes)
+    names = tuple(gemm_axes)
     accepted = 0
     for index in rng.permutation(len(rows)):
-        if accepted >= 2000:
-            break
-        m, k, n = map(int, rows[index])
+        v = dict(zip(names, map(int, rows[index])))
+        m, k, n = (v[key] for key in ("m", "k", "n"))
         spec = GemmSpec(m=m, k=k, n=n)
         weights = rng.integers(-5, 6, (k, n), dtype=np.int8)
         acts = rng.integers(-32, 33, (m, k), dtype=np.int8)
-        cases.append(Case(f"grid_gemm_{accepted:04d}", spec, weights, "KN",
-                          acts, *_random_quant(rng, n)))
+        yield Case(f"grid_gemm_{accepted:0{digits}d}", spec, weights, "KN",
+                   acts, *_random_quant(rng, n))
         accepted += 1
+        if accepted >= 2000 * scale:
+            break
 
 
 CASES = build_cases()
